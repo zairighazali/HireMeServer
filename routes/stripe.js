@@ -30,7 +30,7 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
 
     // Get hire details
     const hireRes = await pool.query(
-      `SELECT 
+      `SELECT
         h.amount,
         h.hired_by_id,
         freelancer.stripe_account_id
@@ -279,18 +279,6 @@ router.post("/onboard", verifyToken, async (req, res) => {
           type: "standard",
           country: "MY", // Malaysia
           email: user.email,
-          capabilities: {
-            card_payments: { requested: true },
-            transfers: { requested: true },
-          },
-          business_type: "individual", // or "company"
-          settings: {
-            payouts: {
-              schedule: {
-                interval: "manual", // or "daily", "weekly", "monthly"
-              },
-            },
-          },
         });
 
         accountId = account.id;
@@ -353,6 +341,35 @@ router.post("/onboard", verifyToken, async (req, res) => {
 });
 
 /**
+ * GET /api/stripe/login-link
+ * Redirect user to Stripe dashboard to complete setup
+ */
+router.get("/login-link", verifyToken, async (req, res) => {
+  try {
+    const { uid } = req.user;
+
+    const userRes = await pool.query(
+      "SELECT stripe_account_id FROM users WHERE firebase_uid = $1",
+      [uid]
+    );
+
+    if (!userRes.rows.length || !userRes.rows[0].stripe_account_id) {
+      return res.status(400).json({ message: "Stripe account not found" });
+    }
+
+    const loginLink = await stripe.accounts.createLoginLink(
+      userRes.rows[0].stripe_account_id
+    );
+
+    res.json({ url: loginLink.url });
+  } catch (err) {
+    console.error("Stripe login link error:", err);
+    res.status(500).json({ message: "Failed to create login link" });
+  }
+});
+
+
+/**
  * GET /api/stripe/account-status
  * Check Stripe account onboarding status
  */
@@ -398,7 +415,7 @@ router.get("/account-status", verifyToken, async (req, res) => {
         detailsSubmitted: account.details_submitted,
       });
 
-      const onboarded = account.charges_enabled && account.payouts_enabled;
+      const onboarded = account.charges_enabled
 
       // Update database if status changed
       if (onboarded !== user.stripe_onboarded) {
