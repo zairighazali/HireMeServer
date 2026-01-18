@@ -1,4 +1,3 @@
-// routes/stripe.js - STANDARDIZED
 import express from "express";
 import Stripe from "stripe";
 import { verifyToken } from "../middleware/auth.js";
