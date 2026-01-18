@@ -8,7 +8,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 /**
  * POST /api/stripe/create-intent/:hireId
- * Create payment intent for a hire
+ * Create payment intent for a hire (Standard Connect Account)
  */
 router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
   try {
@@ -58,19 +58,22 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       });
     }
 
-    // Create PaymentIntent with manual capture (hold funds)
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(hire.amount * 100), // Convert to cents
-      currency: "myr",
-      payment_method_types: ["card"],
-      capture_method: "manual", // Hold funds until work is complete
-      transfer_data: {
-        destination: hire.stripe_account_id,
+    // For Standard accounts, create PaymentIntent ON the connected account
+    // This means the payment goes directly to the freelancer's account
+    const paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: Math.round(hire.amount * 100), // Convert to cents
+        currency: "myr",
+        payment_method_types: ["card"],
+        capture_method: "manual", // Hold funds until work is complete
+        metadata: {
+          hire_id: hireId,
+        },
       },
-      metadata: {
-        hire_id: hireId,
-      },
-    });
+      {
+        stripeAccount: hire.stripe_account_id, // Create on freelancer's account
+      }
+    );
 
     // Save payment_intent_id to hire
     await pool.query("UPDATE hires SET payment_intent_id = $1 WHERE id = $2", [
@@ -84,6 +87,11 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error("POST /stripe/create-intent error:", err);
+    console.error("Error details:", {
+      type: err.type,
+      code: err.code,
+      message: err.message,
+    });
     res.status(500).json({
       message: "Failed to create payment intent",
       error: err.message,
@@ -112,11 +120,16 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
 
     const userId = userRes.rows[0].id;
 
-    // Get hire details
+    // Get hire details including freelancer's stripe account
     const hireRes = await pool.query(
-      `SELECT payment_intent_id, hired_by_id, paid
-       FROM hires
-       WHERE id = $1`,
+      `SELECT
+        h.payment_intent_id,
+        h.hired_by_id,
+        h.paid,
+        freelancer.stripe_account_id
+       FROM hires h
+       JOIN users freelancer ON freelancer.id = h.freelancer_id
+       WHERE h.id = $1`,
       [hireId],
     );
 
@@ -145,9 +158,13 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
       });
     }
 
-    // Capture the held payment
+    // Capture the held payment on the connected account
     const paymentIntent = await stripe.paymentIntents.capture(
       hire.payment_intent_id,
+      {},
+      {
+        stripeAccount: hire.stripe_account_id, // Capture on freelancer's account
+      }
     );
 
     // Mark as paid
@@ -188,11 +205,16 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
 
     const userId = userRes.rows[0].id;
 
-    // Get hire details
+    // Get hire details including freelancer's stripe account
     const hireRes = await pool.query(
-      `SELECT payment_intent_id, hired_by_id, paid
-       FROM hires
-       WHERE id = $1`,
+      `SELECT
+        h.payment_intent_id,
+        h.hired_by_id,
+        h.paid,
+        freelancer.stripe_account_id
+       FROM hires h
+       JOIN users freelancer ON freelancer.id = h.freelancer_id
+       WHERE h.id = $1`,
       [hireId],
     );
 
@@ -215,10 +237,15 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
       });
     }
 
-    // Create refund
-    const refund = await stripe.refunds.create({
-      payment_intent: hire.payment_intent_id,
-    });
+    // Create refund on the connected account
+    const refund = await stripe.refunds.create(
+      {
+        payment_intent: hire.payment_intent_id,
+      },
+      {
+        stripeAccount: hire.stripe_account_id, // Refund on freelancer's account
+      }
+    );
 
     // Mark as unpaid
     await pool.query("UPDATE hires SET paid = false WHERE id = $1", [hireId]);
@@ -237,205 +264,5 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
   }
 });
 
-/**
- * POST /api/stripe/onboard
- * Create Stripe Connect account for freelancer
- */
-router.post("/onboard", verifyToken, async (req, res) => {
-  try {
-    const { uid } = req.user;
-
-    console.log("Starting onboarding for user:", uid);
-
-    // Get user details
-    const userRes = await pool.query(
-      `SELECT id, email, stripe_account_id
-       FROM users
-       WHERE firebase_uid = $1`,
-      [uid],
-    );
-
-    if (!userRes.rows.length) {
-      console.error("User not found:", uid);
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const user = userRes.rows[0];
-    console.log("User found:", {
-      id: user.id,
-      email: user.email,
-      hasAccount: !!user.stripe_account_id,
-    });
-
-    let accountId = user.stripe_account_id;
-
-    // Create account if doesn't exist
-    if (!accountId) {
-      console.log("Creating new Stripe account for:", user.email);
-
-      try {
-        const account = await stripe.accounts.create({
-          type: "standard",
-          country: "MY", // Malaysia
-          email: user.email,
-        });
-
-        accountId = account.id;
-        console.log("Created Stripe account:", accountId);
-
-        // Save to database
-        await pool.query(
-          "UPDATE users SET stripe_account_id = $1 WHERE id = $2",
-          [accountId, user.id],
-        );
-        console.log("Saved account ID to database");
-      } catch (accountError) {
-        console.error("Failed to create Stripe account:", accountError);
-        throw new Error(
-          `Failed to create Stripe account: ${accountError.message}`,
-        );
-      }
-    } else {
-      console.log("Using existing Stripe account:", accountId);
-    }
-
-    // Verify the frontend URL is set
-    if (!process.env.FRONTEND_URL) {
-      throw new Error("FRONTEND_URL environment variable is not set");
-    }
-
-    console.log("Creating account link with:", {
-      accountId,
-      refreshUrl: `${process.env.FRONTEND_URL}/settings/payment`,
-      returnUrl: `${process.env.FRONTEND_URL}/settings/payment?success=true`,
-    });
-
-    // Create account link for onboarding
-    try {
-      const accountLink = await stripe.accountLinks.create({
-        account: accountId,
-        refresh_url: `${process.env.FRONTEND_URL}/settings/payment`,
-        return_url: `${process.env.FRONTEND_URL}/settings/payment?success=true`,
-        type: "account_onboarding",
-      });
-
-      console.log("Account link created successfully:", accountLink.url);
-
-      res.json({
-        success: true,
-        url: accountLink.url,
-      });
-    } catch (linkError) {
-      console.error("Failed to create account link:", linkError);
-      throw new Error(`Failed to create account link: ${linkError.message}`);
-    }
-  } catch (err) {
-    console.error("POST /stripe/onboard error:", err);
-    res.status(500).json({
-      message: "Failed to create onboarding link",
-      error: err.message,
-      details: err.raw?.message || err.raw || undefined,
-    });
-  }
-});
-
-/**
- * GET /api/stripe/login-link
- * Redirect user to Stripe dashboard to complete setup
- */
-
-
-
-/**
- * GET /api/stripe/account-status
- * Check Stripe account onboarding status
- */
-router.get("/account-status", verifyToken, async (req, res) => {
-  try {
-    const { uid } = req.user;
-
-    console.log("Fetching account status for user:", uid);
-
-    const userRes = await pool.query(
-      `SELECT stripe_account_id, stripe_onboarded
-       FROM users
-       WHERE firebase_uid = $1`,
-      [uid],
-    );
-
-    if (!userRes.rows.length) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const user = userRes.rows[0];
-
-    if (!user.stripe_account_id) {
-      console.log("No Stripe account for user");
-      return res.json({
-        onboarded: false,
-        hasAccount: false,
-        chargesEnabled: false,
-        payoutsEnabled: false,
-      });
-    }
-
-    console.log("Checking account status for:", user.stripe_account_id);
-
-    // Check account status with Stripe
-    try {
-      const account = await stripe.accounts.retrieve(user.stripe_account_id);
-
-      console.log("Account status:", {
-        id: account.id,
-        chargesEnabled: account.charges_enabled,
-        payoutsEnabled: account.payouts_enabled,
-        detailsSubmitted: account.details_submitted,
-      });
-
-      const onboarded = account.charges_enabled
-
-      // Update database if status changed
-      if (onboarded !== user.stripe_onboarded) {
-        await pool.query(
-          "UPDATE users SET stripe_onboarded = $1 WHERE firebase_uid = $2",
-          [onboarded, uid],
-        );
-        console.log("Updated stripe_onboarded in database:", onboarded);
-      }
-
-      res.json({
-        onboarded,
-        hasAccount: true,
-        chargesEnabled: account.charges_enabled,
-        payoutsEnabled: account.payouts_enabled,
-        detailsSubmitted: account.details_submitted,
-      });
-    } catch (retrieveError) {
-      console.error("Failed to retrieve account from Stripe:", retrieveError);
-
-      // Account might have been deleted in Stripe
-      if (retrieveError.code === "resource_missing") {
-        await pool.query(
-          "UPDATE users SET stripe_account_id = NULL, stripe_onboarded = false WHERE firebase_uid = $1",
-          [uid],
-        );
-        return res.json({
-          onboarded: false,
-          hasAccount: false,
-          chargesEnabled: false,
-          payoutsEnabled: false,
-        });
-      }
-
-      throw retrieveError;
-    }
-  } catch (err) {
-    console.error("GET /stripe/account-status error:", err);
-    res.status(500).json({
-      message: "Failed to check account status",
-      error: err.message,
-    });
-  }
-});
 
 export default router;
