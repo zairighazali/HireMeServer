@@ -14,19 +14,16 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
   try {
     const { hireId } = req.params;
     const { uid } = req.user;
+    const { paymentMethod } = req.body; // 'card' | 'fpx' | 'grabpay'
 
-    console.log("Creating payment intent for hire:", hireId, "by user:", uid);
+    console.log("Creating payment intent for hire:", hireId, "by user:", uid, "method:", paymentMethod);
 
     // Get user's internal ID
     const userRes = await pool.query(
       "SELECT id FROM users WHERE firebase_uid = $1",
-      [uid],
+      [uid]
     );
-
-    if (!userRes.rows.length) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
+    if (!userRes.rows.length) return res.status(404).json({ message: "User not found" });
     const userId = userRes.rows[0].id;
 
     // Get hire details
@@ -41,34 +38,19 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       FROM hires h
       JOIN users freelancer ON freelancer.id = h.freelancer_id
       WHERE h.id = $1`,
-      [hireId],
+      [hireId]
     );
-
-    if (!hireRes.rows.length) {
-      return res.status(404).json({ message: "Hire not found" });
-    }
+    if (!hireRes.rows.length) return res.status(404).json({ message: "Hire not found" });
 
     const hire = hireRes.rows[0];
 
-    console.log("Hire details:", {
-      hireId: hire.id,
-      amount: hire.amount,
-      hired_by_id: hire.hired_by_id,
-      requestingUserId: userId,
-      stripe_account_id: hire.stripe_account_id,
-    });
-
     // Verify user is the one who hired
     if (hire.hired_by_id !== userId) {
-      return res.status(403).json({
-        message: "You are not authorized to pay for this hire",
-      });
+      return res.status(403).json({ message: "You are not authorized to pay for this hire" });
     }
 
     if (!hire.stripe_account_id) {
-      return res.status(400).json({
-        message: "Freelancer hasn't set up payment account yet",
-      });
+      return res.status(400).json({ message: "Freelancer hasn't set up payment account yet" });
     }
 
     // Check if payment intent already exists
@@ -76,69 +58,58 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       try {
         const existingIntent = await stripe.paymentIntents.retrieve(
           hire.payment_intent_id,
-          {
-            stripeAccount: hire.stripe_account_id,
-          }
+          { stripeAccount: hire.stripe_account_id }
         );
 
-        if (existingIntent.status === 'requires_payment_method' ||
-            existingIntent.status === 'requires_confirmation') {
+        if (["requires_payment_method","requires_confirmation"].includes(existingIntent.status)) {
           console.log("Reusing existing payment intent:", hire.payment_intent_id);
-          return res.json({
-            success: true,
-            clientSecret: existingIntent.client_secret,
-          });
+          return res.json({ success: true, clientSecret: existingIntent.client_secret });
         }
       } catch (err) {
         console.log("Existing payment intent not valid, creating new one");
       }
     }
 
-    // For Standard accounts, create PaymentIntent ON the connected account
+    // Create new payment intent
     console.log("Creating new payment intent on account:", hire.stripe_account_id);
-    
-    const paymentIntent = await stripe.paymentIntents.create(
-      {
-        amount: Math.round(hire.amount * 100), // Convert to cents
-        currency: "myr",
-        payment_method_types: ["card"],
-        capture_method: "manual", // Hold funds until work is complete
-        metadata: {
-          hire_id: hireId.toString(),
-          platform: "hireme",
-        },
+
+    let paymentIntentData = {
+      amount: Math.round(hire.amount * 100),
+      currency: "myr",
+      metadata: {
+        hire_id: hireId.toString(),
+        platform: "hireme",
       },
-      {
-        stripeAccount: hire.stripe_account_id, // Create on freelancer's account
-      }
+    };
+
+    if (paymentMethod === "card") {
+      paymentIntentData.payment_method_types = ["card"];
+      paymentIntentData.capture_method = "manual"; // escrow
+    } else {
+      // FPX / GrabPay
+      paymentIntentData.automatic_payment_methods = { enabled: true };
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create(
+      paymentIntentData,
+      { stripeAccount: hire.stripe_account_id }
     );
 
     console.log("Payment intent created:", paymentIntent.id);
 
     // Save payment_intent_id to hire
-    await pool.query("UPDATE hires SET payment_intent_id = $1 WHERE id = $2", [
-      paymentIntent.id,
-      hireId,
-    ]);
+    await pool.query(
+      "UPDATE hires SET payment_intent_id = $1, payment_method = $2 WHERE id = $3",
+      [paymentIntent.id, paymentMethod, hireId]
+    );
 
-    res.json({
-      success: true,
-      clientSecret: paymentIntent.client_secret,
-    });
+    res.json({ success: true, clientSecret: paymentIntent.client_secret });
   } catch (err) {
     console.error("POST /stripe/create-intent error:", err);
-    console.error("Error details:", {
-      type: err.type,
-      code: err.code,
-      message: err.message,
-      raw: err.raw,
-    });
-    res.status(500).json({
-      message: "Failed to create payment intent",
-      error: err.message,
-    });
+    res.status(500).json({ message: "Failed to create payment intent", error: err.message });
   }
 });
+
 
 /**
  * POST /api/stripe/capture/:hireId
@@ -540,6 +511,127 @@ router.get("/account-status", verifyToken, async (req, res) => {
       message: "Failed to check account status",
       error: err.message,
     });
+  }
+});
+
+// Use raw body for webhook verification
+router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case "payment_intent.succeeded":
+        {
+          const paymentIntent = event.data.object;
+          const hireId = paymentIntent.metadata.hire_id;
+          const paymentMethod = paymentIntent.payment_method_types[0]; // card, fpx, grabpay
+
+          console.log(`Payment succeeded for hire ${hireId}, method: ${paymentMethod}`);
+
+          // Update hires table
+          if (paymentMethod === "card") {
+            // Escrow → don't mark as paid yet, wait capture
+            await pool.query(
+              `UPDATE hires SET payment_status = 'authorized', stripe_payment_id = $1
+               WHERE id = $2`,
+              [paymentIntent.id, hireId]
+            );
+          } else {
+            // FPX / GrabPay → mark as paid (platform account holds funds)
+            await pool.query(
+              `UPDATE hires SET payment_status = 'paid', stripe_payment_id = $1
+               WHERE id = $2`,
+              [paymentIntent.id, hireId]
+            );
+          }
+        }
+        break;
+
+      case "payment_intent.payment_failed":
+        {
+          const paymentIntent = event.data.object;
+          const hireId = paymentIntent.metadata.hire_id;
+          console.log(`Payment failed for hire ${hireId}`);
+          await pool.query(
+            `UPDATE hires SET payment_status = 'failed' WHERE id = $1`,
+            [hireId]
+          );
+        }
+        break;
+
+      default:
+        console.log(`Unhandled event type ${event.type}`);
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook processing error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/stripe/capture/:hireId
+ * Capture card payment and payout to freelancer
+ */
+router.post("/capture/:hireId", verifyToken, async (req, res) => {
+  try {
+    const { hireId } = req.params;
+    const { uid } = req.user;
+
+    // Get hire details
+    const hireRes = await pool.query(
+      `SELECT h.payment_intent_id, h.hired_by_id, h.payment_status, h.amount, h.stripe_payment_id, freelancer.stripe_account_id
+       FROM hires h
+       JOIN users freelancer ON freelancer.id = h.freelancer_id
+       WHERE h.id = $1`,
+      [hireId]
+    );
+
+    if (!hireRes.rows.length) return res.status(404).json({ message: "Hire not found" });
+
+    const hire = hireRes.rows[0];
+
+    if (hire.hired_by_id !== uid) return res.status(403).json({ message: "Not authorized" });
+
+    if (!hire.payment_intent_id) return res.status(400).json({ message: "No payment intent" });
+    if (hire.payment_status !== "authorized") return res.status(400).json({ message: "Payment not authorized or already captured" });
+
+    // Capture card payment
+    const paymentIntent = await stripe.paymentIntents.capture(
+      hire.payment_intent_id,
+      {},
+      { stripeAccount: hire.stripe_account_id }
+    );
+
+    // Mark as paid in table
+    await pool.query(
+      `UPDATE hires SET payment_status = 'paid' WHERE id = $1`,
+      [hireId]
+    );
+
+    // Payout to freelancer
+    const payout = await stripe.transfers.create({
+      amount: Math.round(hire.amount * 100), // in cents
+      currency: "myr",
+      destination: hire.stripe_account_id,
+      source_transaction: paymentIntent.id
+    });
+
+    console.log(`Card payment captured and transferred to freelancer ${hire.stripe_account_id}`);
+
+    res.json({ success: true, paymentIntent, payout });
+  } catch (err) {
+    console.error("Capture error:", err);
+    res.status(500).json({ message: "Failed to capture payment", error: err.message });
   }
 });
 
