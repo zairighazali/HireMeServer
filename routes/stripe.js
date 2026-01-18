@@ -343,68 +343,7 @@ router.post("/onboard", verifyToken, async (req, res) => {
  * GET /api/stripe/login-link
  * Redirect user to Stripe dashboard to complete setup
  */
-router.get("/login-link", verifyToken, async (req, res) => {
-  try {
-    const { uid } = req.user;
 
-    console.log("Creating login link for user:", uid);
-
-    const userRes = await pool.query(
-      "SELECT stripe_account_id, stripe_onboarded FROM users WHERE firebase_uid = $1",
-      [uid]
-    );
-
-    if (!userRes.rows.length) {
-      console.error("User not found:", uid);
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    const user = userRes.rows[0];
-
-    if (!user.stripe_account_id) {
-      console.error("No Stripe account for user:", uid);
-      return res.status(400).json({ message: "Stripe account not found. Please complete onboarding first." });
-    }
-
-    console.log("Checking account status before creating login link");
-   
-    // Check if account is fully onboarded
-    const account = await stripe.accounts.retrieve(user.stripe_account_id);
-   
-    if (!account.charges_enabled || !account.payouts_enabled) {
-      console.error("Account not fully onboarded:", {
-        charges_enabled: account.charges_enabled,
-        payouts_enabled: account.payouts_enabled
-      });
-      return res.status(400).json({
-        message: "Please complete your Stripe onboarding first before accessing the dashboard."
-      });
-    }
-
-    console.log("Creating login link for account:", user.stripe_account_id);
-   
-    const loginLink = await stripe.accounts.createLoginLink(
-      user.stripe_account_id
-    );
-
-    console.log("Login link created successfully");
-
-    res.json({ url: loginLink.url });
-  } catch (err) {
-    console.error("Stripe login link error:", err);
-    console.error("Error details:", {
-      type: err.type,
-      code: err.code,
-      message: err.message,
-      raw: err.raw
-    });
-   
-    res.status(500).json({
-      message: "Failed to create login link",
-      error: err.message
-    });
-  }
-});
 
 
 /**
