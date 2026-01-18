@@ -15,6 +15,8 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
     const { hireId } = req.params;
     const { uid } = req.user;
 
+    console.log("Creating payment intent for hire:", hireId, "by user:", uid);
+
     // Get user's internal ID
     const userRes = await pool.query(
       "SELECT id FROM users WHERE firebase_uid = $1",
@@ -30,9 +32,12 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
     // Get hire details
     const hireRes = await pool.query(
       `SELECT
+        h.id,
         h.amount,
         h.hired_by_id,
-        freelancer.stripe_account_id
+        h.payment_intent_id,
+        freelancer.stripe_account_id,
+        freelancer.email as freelancer_email
       FROM hires h
       JOIN users freelancer ON freelancer.id = h.freelancer_id
       WHERE h.id = $1`,
@@ -44,6 +49,14 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
     }
 
     const hire = hireRes.rows[0];
+
+    console.log("Hire details:", {
+      hireId: hire.id,
+      amount: hire.amount,
+      hired_by_id: hire.hired_by_id,
+      requestingUserId: userId,
+      stripe_account_id: hire.stripe_account_id,
+    });
 
     // Verify user is the one who hired
     if (hire.hired_by_id !== userId) {
@@ -58,8 +71,32 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       });
     }
 
+    // Check if payment intent already exists
+    if (hire.payment_intent_id) {
+      try {
+        const existingIntent = await stripe.paymentIntents.retrieve(
+          hire.payment_intent_id,
+          {
+            stripeAccount: hire.stripe_account_id,
+          }
+        );
+
+        if (existingIntent.status === 'requires_payment_method' ||
+            existingIntent.status === 'requires_confirmation') {
+          console.log("Reusing existing payment intent:", hire.payment_intent_id);
+          return res.json({
+            success: true,
+            clientSecret: existingIntent.client_secret,
+          });
+        }
+      } catch (err) {
+        console.log("Existing payment intent not valid, creating new one");
+      }
+    }
+
     // For Standard accounts, create PaymentIntent ON the connected account
-    // This means the payment goes directly to the freelancer's account
+    console.log("Creating new payment intent on account:", hire.stripe_account_id);
+   
     const paymentIntent = await stripe.paymentIntents.create(
       {
         amount: Math.round(hire.amount * 100), // Convert to cents
@@ -67,13 +104,16 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
         payment_method_types: ["card"],
         capture_method: "manual", // Hold funds until work is complete
         metadata: {
-          hire_id: hireId,
+          hire_id: hireId.toString(),
+          platform: "hireme",
         },
       },
       {
         stripeAccount: hire.stripe_account_id, // Create on freelancer's account
       }
     );
+
+    console.log("Payment intent created:", paymentIntent.id);
 
     // Save payment_intent_id to hire
     await pool.query("UPDATE hires SET payment_intent_id = $1 WHERE id = $2", [
@@ -91,6 +131,7 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       type: err.type,
       code: err.code,
       message: err.message,
+      raw: err.raw,
     });
     res.status(500).json({
       message: "Failed to create payment intent",
@@ -107,6 +148,8 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
   try {
     const { hireId } = req.params;
     const { uid } = req.user;
+
+    console.log("Capturing payment for hire:", hireId, "by user:", uid);
 
     // Get user's internal ID
     const userRes = await pool.query(
@@ -138,6 +181,13 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
     }
 
     const hire = hireRes.rows[0];
+
+    console.log("Capture details:", {
+      payment_intent_id: hire.payment_intent_id,
+      stripe_account_id: hire.stripe_account_id,
+      hired_by_id: hire.hired_by_id,
+      requestingUserId: userId,
+    });
 
     // Verify user is the one who hired
     if (hire.hired_by_id !== userId) {
@@ -158,7 +208,15 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
       });
     }
 
+    if (!hire.stripe_account_id) {
+      return res.status(400).json({
+        message: "Freelancer's Stripe account not found",
+      });
+    }
+
     // Capture the held payment on the connected account
+    console.log("Capturing payment intent:", hire.payment_intent_id, "on account:", hire.stripe_account_id);
+   
     const paymentIntent = await stripe.paymentIntents.capture(
       hire.payment_intent_id,
       {},
@@ -166,6 +224,8 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
         stripeAccount: hire.stripe_account_id, // Capture on freelancer's account
       }
     );
+
+    console.log("Payment captured successfully");
 
     // Mark as paid
     await pool.query("UPDATE hires SET paid = true WHERE id = $1", [hireId]);
@@ -177,6 +237,11 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error("POST /stripe/capture error:", err);
+    console.error("Error details:", {
+      type: err.type,
+      code: err.code,
+      message: err.message,
+    });
     res.status(500).json({
       message: "Failed to capture payment",
       error: err.message,
@@ -192,6 +257,8 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
   try {
     const { hireId } = req.params;
     const { uid } = req.user;
+
+    console.log("Refunding payment for hire:", hireId, "by user:", uid);
 
     // Get user's internal ID
     const userRes = await pool.query(
@@ -224,6 +291,11 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
 
     const hire = hireRes.rows[0];
 
+    console.log("Refund details:", {
+      payment_intent_id: hire.payment_intent_id,
+      stripe_account_id: hire.stripe_account_id,
+    });
+
     // Verify user is the one who hired
     if (hire.hired_by_id !== userId) {
       return res.status(403).json({
@@ -237,6 +309,12 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
       });
     }
 
+    if (!hire.stripe_account_id) {
+      return res.status(400).json({
+        message: "Freelancer's Stripe account not found",
+      });
+    }
+
     // Create refund on the connected account
     const refund = await stripe.refunds.create(
       {
@@ -246,6 +324,8 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
         stripeAccount: hire.stripe_account_id, // Refund on freelancer's account
       }
     );
+
+    console.log("Refund created successfully");
 
     // Mark as unpaid
     await pool.query("UPDATE hires SET paid = false WHERE id = $1", [hireId]);
@@ -257,12 +337,16 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
     });
   } catch (err) {
     console.error("POST /stripe/refund error:", err);
+    console.error("Error details:", {
+      type: err.type,
+      code: err.code,
+      message: err.message,
+    });
     res.status(500).json({
       message: "Failed to refund payment",
       error: err.message,
     });
   }
 });
-
 
 export default router;
