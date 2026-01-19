@@ -8,7 +8,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 /**
  * POST /api/stripe/create-intent/:hireId
- * Create payment intent for a hire (Standard Connect Account)
+ * Create payment intent with destination charge (Standard Connect)
  */
 router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
   try {
@@ -75,10 +75,7 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
     if (hire.payment_intent_id) {
       try {
         const existingIntent = await stripe.paymentIntents.retrieve(
-          hire.payment_intent_id,
-          {
-            stripeAccount: hire.stripe_account_id,
-          }
+          hire.payment_intent_id
         );
 
         if (existingIntent.status === 'requires_payment_method' ||
@@ -94,24 +91,30 @@ router.post("/create-intent/:hireId", verifyToken, async (req, res) => {
       }
     }
 
-    // For Standard accounts, create PaymentIntent ON the connected account
-    console.log("Creating new payment intent on account:", hire.stripe_account_id);
+    // Calculate platform fee (10% example - adjust as needed)
+    const platformFeeAmount = Math.round(hire.amount * 100 * 0.10); // 10% fee in cents
+    const totalAmount = Math.round(hire.amount * 100); // Total in cents
+
+    // Create PaymentIntent with DESTINATION CHARGE
+    // Charge happens on YOUR platform, funds go to connected account
+    console.log("Creating destination charge payment intent");
     
-    const paymentIntent = await stripe.paymentIntents.create(
-      {
-        amount: Math.round(hire.amount * 100), // Convert to cents
-        currency: "myr",
-        payment_method_types: ["card"],
-        capture_method: "manual", // Hold funds until work is complete
-        metadata: {
-          hire_id: hireId.toString(),
-          platform: "hireme",
-        },
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: totalAmount,
+      currency: "myr",
+      payment_method_types: ["card"],
+      capture_method: "manual", // Hold funds until work is complete
+      application_fee_amount: platformFeeAmount, // Your platform fee
+      transfer_data: {
+        destination: hire.stripe_account_id, // Freelancer gets the rest
       },
-      {
-        stripeAccount: hire.stripe_account_id, // Create on freelancer's account
-      }
-    );
+      metadata: {
+        hire_id: hireId.toString(),
+        platform: "hireme",
+        freelancer_amount: (totalAmount - platformFeeAmount).toString(),
+        platform_fee: platformFeeAmount.toString(),
+      },
+    });
 
     console.log("Payment intent created:", paymentIntent.id);
 
@@ -163,15 +166,13 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
 
     const userId = userRes.rows[0].id;
 
-    // Get hire details including freelancer's stripe account
+    // Get hire details
     const hireRes = await pool.query(
       `SELECT
         h.payment_intent_id,
         h.hired_by_id,
-        h.paid,
-        freelancer.stripe_account_id
+        h.paid
        FROM hires h
-       JOIN users freelancer ON freelancer.id = h.freelancer_id
        WHERE h.id = $1`,
       [hireId],
     );
@@ -184,7 +185,6 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
 
     console.log("Capture details:", {
       payment_intent_id: hire.payment_intent_id,
-      stripe_account_id: hire.stripe_account_id,
       hired_by_id: hire.hired_by_id,
       requestingUserId: userId,
     });
@@ -208,21 +208,11 @@ router.post("/capture/:hireId", verifyToken, async (req, res) => {
       });
     }
 
-    if (!hire.stripe_account_id) {
-      return res.status(400).json({
-        message: "Freelancer's Stripe account not found",
-      });
-    }
-
-    // Capture the held payment on the connected account
-    console.log("Capturing payment intent:", hire.payment_intent_id, "on account:", hire.stripe_account_id);
+    // Capture the held payment (no stripeAccount needed - it's on your platform)
+    console.log("Capturing payment intent:", hire.payment_intent_id);
     
     const paymentIntent = await stripe.paymentIntents.capture(
-      hire.payment_intent_id,
-      {},
-      {
-        stripeAccount: hire.stripe_account_id, // Capture on freelancer's account
-      }
+      hire.payment_intent_id
     );
 
     console.log("Payment captured successfully");
@@ -272,15 +262,13 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
 
     const userId = userRes.rows[0].id;
 
-    // Get hire details including freelancer's stripe account
+    // Get hire details
     const hireRes = await pool.query(
       `SELECT
         h.payment_intent_id,
         h.hired_by_id,
-        h.paid,
-        freelancer.stripe_account_id
+        h.paid
        FROM hires h
-       JOIN users freelancer ON freelancer.id = h.freelancer_id
        WHERE h.id = $1`,
       [hireId],
     );
@@ -293,7 +281,6 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
 
     console.log("Refund details:", {
       payment_intent_id: hire.payment_intent_id,
-      stripe_account_id: hire.stripe_account_id,
     });
 
     // Verify user is the one who hired
@@ -309,21 +296,10 @@ router.post("/refund/:hireId", verifyToken, async (req, res) => {
       });
     }
 
-    if (!hire.stripe_account_id) {
-      return res.status(400).json({
-        message: "Freelancer's Stripe account not found",
-      });
-    }
-
-    // Create refund on the connected account
-    const refund = await stripe.refunds.create(
-      {
-        payment_intent: hire.payment_intent_id,
-      },
-      {
-        stripeAccount: hire.stripe_account_id, // Refund on freelancer's account
-      }
-    );
+    // Create refund (no stripeAccount needed - refunds happen on your platform)
+    const refund = await stripe.refunds.create({
+      payment_intent: hire.payment_intent_id,
+    });
 
     console.log("Refund created successfully");
 
