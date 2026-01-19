@@ -1,10 +1,34 @@
 import express from "express";
 import { pool } from "../db.js";
 import { verifyToken } from "../middleware/auth.js";
-import { db } from "../firebase-admin.js";
-import { getIO } from "../socket.js";
+import admin from "firebase-admin";
 
 const router = express.Router();
+
+// Get Firebase database reference
+const db = admin.database();
+
+// Helper function to safely emit socket events
+function safeEmit(io, room, event, data) {
+  try {
+    if (io && typeof io.to === 'function') {
+      io.to(room).emit(event, data);
+    }
+  } catch (err) {
+    console.error('Socket emit error (non-critical):', err.message);
+  }
+}
+
+// Get Socket.io instance safely
+function getIO() {
+  try {
+    const { getIO: getIOFunc } = require("../socket.js");
+    return getIOFunc();
+  } catch (err) {
+    console.warn('Socket.io not available:', err.message);
+    return null;
+  }
+}
 
 // Get all my conversations
 router.get("/", verifyToken, async (req, res) => {
@@ -66,7 +90,7 @@ router.post("/start", verifyToken, async (req, res) => {
 
     // Get both users' internal IDs
     const usersRes = await pool.query(
-      "SELECT id, firebase_uid FROM users WHERE firebase_uid = ANY($1::text[])",
+      "SELECT id, firebase_uid, name, image_url FROM users WHERE firebase_uid = ANY($1::text[])",
       [[uid, other_uid]]
     );
 
@@ -76,11 +100,11 @@ router.post("/start", verifyToken, async (req, res) => {
 
     const userMap = {};
     usersRes.rows.forEach((u) => {
-      userMap[u.firebase_uid] = u.id;
+      userMap[u.firebase_uid] = u;
     });
 
-    const myId = userMap[uid];
-    const otherId = userMap[other_uid];
+    const myId = userMap[uid].id;
+    const otherId = userMap[other_uid].id;
 
     // Find or create conversation
     let convRes = await pool.query(
@@ -103,26 +127,14 @@ router.post("/start", verifyToken, async (req, res) => {
       conversation = insertRes.rows[0];
     }
 
-    // Get other user details
-    const otherUserRes = await pool.query(
-      `SELECT 
-        id,
-        firebase_uid AS uid,
-        name,
-        image_url
-      FROM users
-      WHERE id = $1`,
-      [otherId]
-    );
-
     res.json({
       conversation_id: conversation.id,
-      other_user: otherUserRes.rows[0],
+      other_user: userMap[other_uid],
       created_at: conversation.created_at,
     });
   } catch (err) {
     console.error("POST /chats/start error:", err);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
@@ -168,7 +180,7 @@ router.get("/:chatId/messages", verifyToken, async (req, res) => {
         sender_uid: msg.senderUid,
         content: msg.content,
         created_at: msg.createdAt,
-        timestamp: msg.timestamp,
+        timestamp: msg.timestamp || 0,
       })).sort((a, b) => a.timestamp - b.timestamp);
     }
 
@@ -249,10 +261,10 @@ router.post("/send", verifyToken, async (req, res) => {
     const currentUnread = unreadSnapshot.val() || 0;
     await unreadRef.set(currentUnread + 1);
 
-    // Emit via Socket.io to receiver
-    try {
-      const io = getIO();
-      io.to(receiverUid).emit("new_message", {
+    // Try to emit via Socket.io (non-blocking)
+    const io = getIO();
+    if (io) {
+      safeEmit(io, receiverUid, "new_message", {
         conversationId: chatId,
         message: {
           id: messageId,
@@ -265,8 +277,7 @@ router.post("/send", verifyToken, async (req, res) => {
         },
       });
 
-      // Send notification via Socket.io
-      io.to(receiverUid).emit("notification", {
+      safeEmit(io, receiverUid, "notification", {
         type: "new_message",
         message: `New message from ${senderInfo.name}`,
         conversationId: chatId,
@@ -274,9 +285,6 @@ router.post("/send", verifyToken, async (req, res) => {
         senderName: senderInfo.name,
         timestamp: timestamp,
       });
-    } catch (socketErr) {
-      console.error("Socket emit error:", socketErr);
-      // Continue even if socket fails
     }
 
     res.json({
@@ -299,7 +307,7 @@ router.post("/:chatId/read", verifyToken, async (req, res) => {
     // Reset unread count to 0
     await db.ref(`unread/${uid}/${chatId}`).set(0);
 
-    // Emit to other user that messages were seen
+    // Try to emit to other user that messages were seen
     const userRes = await pool.query(
       "SELECT id FROM users WHERE firebase_uid = $1",
       [uid]
@@ -323,14 +331,12 @@ router.post("/:chatId/read", verifyToken, async (req, res) => {
         );
 
         if (otherUserRes.rows.length) {
-          try {
-            const io = getIO();
-            io.to(otherUserRes.rows[0].firebase_uid).emit("messages_seen", {
+          const io = getIO();
+          if (io) {
+            safeEmit(io, otherUserRes.rows[0].firebase_uid, "messages_seen", {
               conversationId: chatId,
               seenBy: uid,
             });
-          } catch (socketErr) {
-            console.error("Socket emit error:", socketErr);
           }
         }
       }
@@ -374,15 +380,13 @@ router.post("/:chatId/typing", verifyToken, async (req, res) => {
         );
 
         if (otherUserRes.rows.length) {
-          try {
-            const io = getIO();
-            io.to(otherUserRes.rows[0].firebase_uid).emit("user_typing", {
+          const io = getIO();
+          if (io) {
+            safeEmit(io, otherUserRes.rows[0].firebase_uid, "user_typing", {
               conversationId: chatId,
               userUid: uid,
               isTyping: isTyping,
             });
-          } catch (socketErr) {
-            console.error("Socket emit error:", socketErr);
           }
         }
       }
