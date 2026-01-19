@@ -115,6 +115,7 @@ router.post("/me", verifyToken, async (req, res) => {
          stripe_customer_id,
          stripe_account_id,
          stripe_onboarded,
+         is_best_hired,
          created_at`,
       [uid, name, email, picture || null],
     );
@@ -147,6 +148,7 @@ router.get("/me", verifyToken, async (req, res) => {
         stripe_customer_id,
         stripe_account_id,
         stripe_onboarded,
+        is_best_hired,
         created_at
       FROM users
       WHERE firebase_uid = $1`,
