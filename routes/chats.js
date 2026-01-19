@@ -8,28 +8,6 @@ const router = express.Router();
 // Get Firebase database reference
 const db = admin.database();
 
-// Helper function to safely emit socket events
-function safeEmit(io, room, event, data) {
-  try {
-    if (io && typeof io.to === 'function') {
-      io.to(room).emit(event, data);
-    }
-  } catch (err) {
-    console.error('Socket emit error (non-critical):', err.message);
-  }
-}
-
-// Get Socket.io instance safely
-function getIO() {
-  try {
-    const { getIO: getIOFunc } = require("../socket.js");
-    return getIOFunc();
-  } catch (err) {
-    console.warn('Socket.io not available:', err.message);
-    return null;
-  }
-}
-
 // Get all my conversations
 router.get("/", verifyToken, async (req, res) => {
   try {
@@ -246,6 +224,8 @@ router.post("/send", verifyToken, async (req, res) => {
     const timestamp = Date.now();
     const firebaseMessage = {
       senderUid: senderUid,
+      senderName: senderInfo.name,
+      senderImage: senderInfo.image_url,
       content: content.trim(),
       createdAt: new Date().toISOString(),
       timestamp: timestamp,
@@ -261,31 +241,19 @@ router.post("/send", verifyToken, async (req, res) => {
     const currentUnread = unreadSnapshot.val() || 0;
     await unreadRef.set(currentUnread + 1);
 
-    // Try to emit via Socket.io (non-blocking)
-    const io = getIO();
-    if (io) {
-      safeEmit(io, receiverUid, "new_message", {
-        conversationId: chatId,
-        message: {
-          id: messageId,
-          sender_uid: senderUid,
-          sender_name: senderInfo.name,
-          sender_image: senderInfo.image_url,
-          content: content.trim(),
-          created_at: firebaseMessage.createdAt,
-          timestamp: timestamp,
-        },
-      });
+    // Send notification via Firebase
+    await db.ref(`notifications/${receiverUid}`).push({
+      type: "new_message",
+      message: `New message from ${senderInfo.name}`,
+      conversationId: chatId,
+      senderUid: senderUid,
+      senderName: senderInfo.name,
+      timestamp: timestamp,
+      read: false,
+    });
 
-      safeEmit(io, receiverUid, "notification", {
-        type: "new_message",
-        message: `New message from ${senderInfo.name}`,
-        conversationId: chatId,
-        senderUid: senderUid,
-        senderName: senderInfo.name,
-        timestamp: timestamp,
-      });
-    }
+    // Update typing status (stop typing)
+    await db.ref(`typing/${chatId}/${senderUid}`).set(null);
 
     res.json({
       success: true,
@@ -307,40 +275,11 @@ router.post("/:chatId/read", verifyToken, async (req, res) => {
     // Reset unread count to 0
     await db.ref(`unread/${uid}/${chatId}`).set(0);
 
-    // Try to emit to other user that messages were seen
-    const userRes = await pool.query(
-      "SELECT id FROM users WHERE firebase_uid = $1",
-      [uid]
-    );
-
-    if (userRes.rows.length) {
-      const userId = userRes.rows[0].id;
-      
-      const convRes = await pool.query(
-        `SELECT user_a, user_b FROM conversations WHERE id = $1`,
-        [chatId]
-      );
-
-      if (convRes.rows.length) {
-        const conv = convRes.rows[0];
-        const otherUserId = conv.user_a === userId ? conv.user_b : conv.user_a;
-        
-        const otherUserRes = await pool.query(
-          "SELECT firebase_uid FROM users WHERE id = $1",
-          [otherUserId]
-        );
-
-        if (otherUserRes.rows.length) {
-          const io = getIO();
-          if (io) {
-            safeEmit(io, otherUserRes.rows[0].firebase_uid, "messages_seen", {
-              conversationId: chatId,
-              seenBy: uid,
-            });
-          }
-        }
-      }
-    }
+    // Update read status in Firebase
+    await db.ref(`read/${chatId}/${uid}`).set({
+      timestamp: Date.now(),
+      lastRead: new Date().toISOString(),
+    });
 
     res.json({ success: true });
   } catch (err) {
@@ -349,52 +288,52 @@ router.post("/:chatId/read", verifyToken, async (req, res) => {
   }
 });
 
-// Typing indicator
+// Set typing indicator
 router.post("/:chatId/typing", verifyToken, async (req, res) => {
   try {
     const chatId = req.params.chatId;
     const uid = req.user.uid;
     const { isTyping } = req.body;
 
-    // Get other user in conversation
-    const userRes = await pool.query(
-      "SELECT id FROM users WHERE firebase_uid = $1",
-      [uid]
-    );
-
-    if (userRes.rows.length) {
-      const userId = userRes.rows[0].id;
-      
-      const convRes = await pool.query(
-        `SELECT user_a, user_b FROM conversations WHERE id = $1`,
-        [chatId]
-      );
-
-      if (convRes.rows.length) {
-        const conv = convRes.rows[0];
-        const otherUserId = conv.user_a === userId ? conv.user_b : conv.user_a;
-        
-        const otherUserRes = await pool.query(
-          "SELECT firebase_uid FROM users WHERE id = $1",
-          [otherUserId]
-        );
-
-        if (otherUserRes.rows.length) {
-          const io = getIO();
-          if (io) {
-            safeEmit(io, otherUserRes.rows[0].firebase_uid, "user_typing", {
-              conversationId: chatId,
-              userUid: uid,
-              isTyping: isTyping,
-            });
-          }
-        }
-      }
+    if (isTyping) {
+      // Set typing with auto-expire timestamp
+      await db.ref(`typing/${chatId}/${uid}`).set({
+        isTyping: true,
+        timestamp: Date.now(),
+      });
+    } else {
+      // Remove typing indicator
+      await db.ref(`typing/${chatId}/${uid}`).set(null);
     }
 
     res.json({ success: true });
   } catch (err) {
     console.error("POST /chats/:chatId/typing error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Set online status
+router.post("/online", verifyToken, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const { isOnline } = req.body;
+
+    if (isOnline) {
+      await db.ref(`presence/${uid}`).set({
+        online: true,
+        lastSeen: Date.now(),
+      });
+    } else {
+      await db.ref(`presence/${uid}`).set({
+        online: false,
+        lastSeen: Date.now(),
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("POST /chats/online error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });

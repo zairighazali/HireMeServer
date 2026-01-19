@@ -1,8 +1,8 @@
-// routes/conversations.js - STANDARDIZED
 import express from "express";
 import { pool } from "../db.js";
 import { verifyToken } from "../middleware/auth.js";
-import { sendMessageToUser } from "../socket.js";
+//import { sendMessageToUser } from "../socket.js";
+
 
 const router = express.Router();
 
