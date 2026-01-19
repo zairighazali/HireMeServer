@@ -96,10 +96,21 @@ router.post("/", verifyToken, async (req, res) => {
       });
     }
 
+    // ✅ PAYMENT VALIDATION
+    if (payment !== undefined && payment !== null) {
+      const parsedPayment = Number(payment);
+
+      if (isNaN(parsedPayment) || parsedPayment <= 0) {
+        return res.status(400).json({
+          message: "Payment must be a number greater than 0",
+        });
+      }
+    }
+
     // Get user's internal ID
     const userRes = await pool.query(
       "SELECT id FROM users WHERE firebase_uid = $1",
-      [uid],
+      [uid]
     );
 
     if (!userRes.rows.length) {
@@ -110,12 +121,12 @@ router.post("/", verifyToken, async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO jobs (
-        owner_id, 
-        title, 
-        description, 
-        is_remote, 
-        location, 
-        payment, 
+        owner_id,
+        title,
+        description,
+        is_remote,
+        location,
+        payment,
         status
       )
       VALUES ($1, $2, $3, $4, $5, $6, 'open')
@@ -126,8 +137,8 @@ router.post("/", verifyToken, async (req, res) => {
         description,
         !!is_remote,
         is_remote ? null : location || null,
-        payment || null,
-      ],
+        payment ?? null,
+      ]
     );
 
     res.status(201).json(result.rows[0]);
@@ -147,10 +158,21 @@ router.put("/:id", verifyToken, async (req, res) => {
     const { id } = req.params;
     const { title, description, is_remote, location, payment } = req.body;
 
+    // ✅ PAYMENT VALIDATION
+    if (payment !== undefined && payment !== null) {
+      const parsedPayment = Number(payment);
+
+      if (isNaN(parsedPayment) || parsedPayment <= 0) {
+        return res.status(400).json({
+          message: "Payment must be a number greater than 0",
+        });
+      }
+    }
+
     // Get user's internal ID
     const userRes = await pool.query(
       "SELECT id FROM users WHERE firebase_uid = $1",
-      [uid],
+      [uid]
     );
 
     if (!userRes.rows.length) {
@@ -161,17 +183,20 @@ router.put("/:id", verifyToken, async (req, res) => {
 
     const result = await pool.query(
       `UPDATE jobs
-       SET 
+       SET
          title = COALESCE($1, title),
          description = COALESCE($2, description),
          is_remote = COALESCE($3, is_remote),
-         location = CASE WHEN $3 = true THEN null ELSE COALESCE($4, location) END,
+         location = CASE
+           WHEN $3 = true THEN null
+           ELSE COALESCE($4, location)
+         END,
          payment = COALESCE($5, payment)
-       WHERE id = $6 
-         AND owner_id = $7 
+       WHERE id = $6
+         AND owner_id = $7
          AND status = 'open'
        RETURNING *`,
-      [title, description, is_remote, location, payment, id, ownerId],
+      [title, description, is_remote, location, payment, id, ownerId]
     );
 
     if (!result.rows.length) {
@@ -186,6 +211,7 @@ router.put("/:id", verifyToken, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 /**
  * DELETE /api/jobs/:id
