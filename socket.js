@@ -1,54 +1,69 @@
-// socket.js
 import { Server } from "socket.io";
 
 let io;
-const connectedUsers = {}; // { firebaseUid: socket.id }
 
 export function initSocket(server, admin) {
-  io = new Server(server, { cors: { origin: "*" } });
+  io = new Server(server, {
+    cors: {
+      origin: "*", // Update with your frontend URL in production
+      methods: ["GET", "POST"],
+    },
+  });
 
-  // Auth middleware
   io.use(async (socket, next) => {
-    const token = socket.handshake.auth?.token;
-    if (!token) return next(new Error("Unauthorized"));
-
     try {
-      const decoded = await admin.auth().verifyIdToken(token);
-      socket.uid = decoded.uid;
+      const token = socket.handshake.auth.token;
+      
+      if (!token) {
+        return next(new Error("Authentication error: No token provided"));
+      }
+
+      // Verify Firebase token
+      const decodedToken = await admin.auth().verifyIdToken(token);
+      socket.userId = decodedToken.uid;
+      
       next();
-    } catch {
-      next(new Error("Invalid token"));
+    } catch (error) {
+      console.error("Socket authentication error:", error);
+      next(new Error("Authentication error"));
     }
   });
 
   io.on("connection", (socket) => {
-    console.log("User connected:", socket.uid);
-    connectedUsers[socket.uid] = socket.id;
+    const userId = socket.userId;
+    console.log(`User connected: ${userId} (socket: ${socket.id})`);
 
-    // Listen for sending messages
-    socket.on("send_message", (data) => {
-      const { receiverUid } = data;
-      const receiverSocket = connectedUsers[receiverUid];
-      if (receiverSocket && io) {
-        io.to(receiverSocket).emit("receive_message", data);
-      }
+    // Join user's personal room (for receiving messages)
+    socket.join(userId);
+
+    // Set user online status
+    socket.broadcast.emit("user_online", { userId });
+
+    // Handle disconnect
+    socket.on("disconnect", () => {
+      console.log(`User disconnected: ${userId}`);
+      socket.broadcast.emit("user_offline", { userId });
     });
 
-    socket.on("disconnect", () => {
-      console.log("User disconnected:", socket.uid);
-      delete connectedUsers[socket.uid];
+    // Join conversation room
+    socket.on("join_conversation", (conversationId) => {
+      socket.join(`conversation_${conversationId}`);
+      console.log(`User ${userId} joined conversation ${conversationId}`);
+    });
+
+    // Leave conversation room
+    socket.on("leave_conversation", (conversationId) => {
+      socket.leave(`conversation_${conversationId}`);
+      console.log(`User ${userId} left conversation ${conversationId}`);
     });
   });
 
   return io;
 }
 
-// Emit message manually
-export function sendMessageToUser(receiverUid, message) {
-  const socketId = connectedUsers[receiverUid];
-  if (socketId && io) io.to(socketId).emit("receive_message", message);
-}
-
-export function getSocket() {
-  return { io, connectedUsers };
+export function getIO() {
+  if (!io) {
+    throw new Error("Socket.io not initialized!");
+  }
+  return io;
 }
