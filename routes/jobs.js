@@ -141,15 +141,18 @@ router.post("/", verifyToken, async (req, res) => {
       }
     }
 
-    // ✅ PAYMENT VALIDATION
-    if (payment !== undefined && payment !== null) {
-      const parsedPayment = Number(payment);
+    // ✅ PAYMENT VALIDATION - MANDATORY
+    if (payment === undefined || payment === null || payment === "") {
+      return res.status(400).json({
+        message: "Payment amount is required",
+      });
+    }
 
-      if (isNaN(parsedPayment) || parsedPayment <= 0) {
-        return res.status(400).json({
-          message: "Payment must be a number greater than 0",
-        });
-      }
+    const parsedPayment = Number(payment);
+    if (isNaN(parsedPayment) || parsedPayment <= 0) {
+      return res.status(400).json({
+        message: "Payment must be a number greater than 0",
+      });
     }
 
     // Get user's internal ID
@@ -182,7 +185,7 @@ router.post("/", verifyToken, async (req, res) => {
         description,
         !!is_remote,
         is_remote ? null : location || null,
-        payment ?? null,
+        parsedPayment,
       ]
     );
 
@@ -219,15 +222,18 @@ router.put("/:id", verifyToken, async (req, res) => {
       }
     }
 
-    // ✅ PAYMENT VALIDATION
-    if (payment !== undefined && payment !== null) {
-      const parsedPayment = Number(payment);
+    // ✅ PAYMENT VALIDATION - MANDATORY
+    if (payment === undefined || payment === null || payment === "") {
+      return res.status(400).json({
+        message: "Payment amount is required",
+      });
+    }
 
-      if (isNaN(parsedPayment) || parsedPayment <= 0) {
-        return res.status(400).json({
-          message: "Payment must be a number greater than 0",
-        });
-      }
+    const parsedPayment = Number(payment);
+    if (isNaN(parsedPayment) || parsedPayment <= 0) {
+      return res.status(400).json({
+        message: "Payment must be a number greater than 0",
+      });
     }
 
     // Get user's internal ID
@@ -257,7 +263,7 @@ router.put("/:id", verifyToken, async (req, res) => {
          AND owner_id = $7
          AND status = 'open'
        RETURNING *`,
-      [title, description, is_remote, location, payment, id, ownerId]
+      [title, description, is_remote, location, parsedPayment, id, ownerId]
     );
 
     if (!result.rows.length) {
