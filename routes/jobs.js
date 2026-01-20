@@ -1,9 +1,38 @@
-// routes/jobs.js - STANDARDIZED
+// routes/jobs.js - STANDARDIZED WITH MALAYSIA VALIDATION
 import express from "express";
 import { pool } from "../db.js";
 import { verifyToken } from "../middleware/auth.js";
 
 const router = express.Router();
+
+// List of Malaysian states and territories
+const MALAYSIAN_LOCATIONS = [
+  "johor",
+  "kedah",
+  "kelantan",
+  "malacca",
+  "melaka",
+  "negeri sembilan",
+  "pahang",
+  "penang",
+  "pulau pinang",
+  "perak",
+  "perlis",
+  "sabah",
+  "sarawak",
+  "selangor",
+  "terengganu",
+  "kuala lumpur",
+  "labuan",
+  "putrajaya",
+];
+
+// Helper function to validate Malaysian location
+function isValidMalaysianLocation(location) {
+  if (!location) return false;
+  const normalizedLocation = location.trim().toLowerCase();
+  return MALAYSIAN_LOCATIONS.includes(normalizedLocation);
+}
 
 /**
  * GET /api/jobs
@@ -96,6 +125,22 @@ router.post("/", verifyToken, async (req, res) => {
       });
     }
 
+    // ✅ VALIDATE REMOTE OR LOCATION IS MANDATORY
+    if (!is_remote && !location) {
+      return res.status(400).json({
+        message: "Please specify a location or select remote work",
+      });
+    }
+
+    // ✅ VALIDATE MALAYSIA LOCATION ONLY
+    if (!is_remote && location) {
+      if (!isValidMalaysianLocation(location)) {
+        return res.status(400).json({
+          message: "Location must be a valid Malaysian state or territory",
+        });
+      }
+    }
+
     // ✅ PAYMENT VALIDATION
     if (payment !== undefined && payment !== null) {
       const parsedPayment = Number(payment);
@@ -157,6 +202,22 @@ router.put("/:id", verifyToken, async (req, res) => {
     const { uid } = req.user;
     const { id } = req.params;
     const { title, description, is_remote, location, payment } = req.body;
+
+    // ✅ VALIDATE REMOTE OR LOCATION IS MANDATORY
+    if (is_remote === false && !location) {
+      return res.status(400).json({
+        message: "Please specify a location or select remote work",
+      });
+    }
+
+    // ✅ VALIDATE MALAYSIA LOCATION ONLY
+    if (!is_remote && location) {
+      if (!isValidMalaysianLocation(location)) {
+        return res.status(400).json({
+          message: "Location must be a valid Malaysian state or territory",
+        });
+      }
+    }
 
     // ✅ PAYMENT VALIDATION
     if (payment !== undefined && payment !== null) {
@@ -282,12 +343,19 @@ router.post("/:id/interest", verifyToken, async (req, res) => {
 
     // Check if job exists and is open
     const jobRes = await pool.query(
-      "SELECT id, status FROM jobs WHERE id = $1",
+      "SELECT id, status, owner_id FROM jobs WHERE id = $1",
       [id],
     );
 
     if (!jobRes.rows.length) {
       return res.status(404).json({ message: "Job not found" });
+    }
+
+    // ✅ PREVENT JOB OWNER FROM APPLYING TO THEIR OWN JOB
+    if (jobRes.rows[0].owner_id === userId) {
+      return res.status(403).json({ 
+        message: "You cannot apply to your own job posting" 
+      });
     }
 
     if (jobRes.rows[0].status !== "open") {
