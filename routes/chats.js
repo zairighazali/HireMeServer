@@ -319,22 +319,21 @@ router.post("/online", verifyToken, async (req, res) => {
     const uid = req.user.uid;
     const { isOnline } = req.body;
 
-    if (isOnline) {
-      await db.ref(`presence/${uid}`).set({
-        online: true,
-        lastSeen: Date.now(),
-      });
-    } else {
-      await db.ref(`presence/${uid}`).set({
-        online: false,
-        lastSeen: Date.now(),
-      });
-    }
+    console.log(`Setting online status for ${uid}: ${isOnline}`);
 
-    res.json({ success: true });
+    const presenceData = {
+      online: Boolean(isOnline),
+      lastSeen: Date.now(),
+    };
+
+    await db.ref(`presence/${uid}`).set(presenceData);
+    
+    console.log(`Successfully set presence for ${uid}:`, presenceData);
+
+    res.json({ success: true, presence: presenceData });
   } catch (err) {
     console.error("POST /chats/online error:", err);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
